@@ -1,0 +1,1011 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+
+# LIBRERÍAS
+```{r, message=F, warning=F}
+library(jsonlite)
+library(here)
+library(dplyr)
+library(ggplot2)
+library(purrr)
+library(stringr)
+library(plotly)
+library(tidyr)
+library(corrplot)
+library(psych)
+library(openxlsx)
+library(ggrepel)
+library(smacof)
+```
+
+
+# DATOS
+```{r, warning=F}
+ruta <- here("Datos")
+
+archivos <- list.files(
+  path = ruta,
+  pattern = "_events\\.json$",
+  full.names = TRUE
+)
+
+datos_eventos <- map_df(
+  archivos,
+  ~ fromJSON(.x, flatten = TRUE)
+)
+
+jugadores <- stream_in(
+  file(here("Datos", "00_info_player_stats_11_317.json")),
+  verbose = FALSE
+)
+```
+
+
+# FILTRO JUGADORES
+```{r}
+jugadores2 <- jugadores |> 
+  filter(player_season_minutes > 1000)
+
+datos_eventos2 <- datos_eventos |> 
+  filter(player.name %in% unique(jugadores2$player_name), lengths(location) > 0) |> 
+  select(team.name, player.name, position.name, type.name, location) |> 
+  mutate(type.name = str_replace(type.name, "Ball Receipt\\*", "Ball Receipt"))
+```
+
+
+# CONFIGURACIÓN CAMPO
+```{r}
+field_length <- 120
+field_width  <- 80
+
+n_cols <- 4
+n_rows <- 5
+
+col_width  <- field_length / n_cols   # 40
+row_height <- field_width / n_rows    # 16
+```
+
+
+# DIVISIÓN SECTORES
+```{r}
+sectors <- expand.grid(col = 1:n_cols, row = 1:n_rows)
+
+sectors$xmin <- (sectors$col - 1) * col_width
+sectors$xmax <- sectors$col * col_width
+sectors$ymin <- (sectors$row - 1) * row_height
+sectors$ymax <- sectors$row * row_height
+
+sectors <- sectors[order(sectors$col, sectors$row), ]
+sectors$cell <- paste0("C", seq_len(nrow(sectors)))
+
+sectors$xcenter <- (sectors$xmin + sectors$xmax) / 2
+sectors$ycenter <- (sectors$ymin + sectors$ymax) / 2
+```
+
+
+## Gráfico del campo
+```{r, warning=F}
+ggplot() +
+  geom_rect(aes(xmin = 0, xmax = field_length, ymin = 0, ymax = field_width),
+            fill = "#2E8B57", colour = "white", size = 1) +
+  geom_vline(xintercept = seq(col_width, field_length - col_width, by = col_width),
+             colour = "white", size = 0.8) +
+  geom_hline(yintercept = seq(row_height, field_width - row_height, by = row_height),
+             colour = "white", size = 0.6) +
+  geom_text(data = sectors, aes(x = xcenter, y = ycenter, label = cell),
+            colour = "white", size = 5, fontface = "bold") +
+  coord_fixed(xlim = c(0, field_length), ylim = c(0, field_width), expand = FALSE) +
+  scale_y_reverse() +  # 0,0 arriba
+  labs(title = "Campo de fútbol 120x80",
+       x = "Largo (m)", y = "Ancho (m)") +
+  theme_minimal(base_size = 14) +
+  theme(panel.background = element_rect(fill = "#2E8B57", colour = NA),
+        plot.background = element_rect(fill = "#2E8B57", colour = NA),
+        panel.grid.major = element_line(colour = "white", linetype = "dashed", size = 0.3),
+        panel.grid.minor = element_blank(),
+        axis.title = element_text(colour = "white", face = "bold"),
+        axis.text = element_text(colour = "white"),
+        plot.title = element_text(colour = "white", face = "bold", hjust = 0.5))
+```
+
+
+# FUNCIÓN PARA UBICAR PUNTOS
+```{r}
+identificar_sector <- function(x, y, tabla = sectors) {
+  if (y < 0 | y > field_width | x < 0 | x > field_length) {
+    return("Fuera del campo")
+  }
+  sector <- tabla[tabla$xmin <= x & x < tabla$xmax &
+                    tabla$ymin <= y & y < tabla$ymax, ]
+  if (nrow(sector) == 0) {
+    return("Fuera del campo")
+  } else {
+    return(sector$cell)
+  }
+}
+```
+
+
+# AÑADIR SECTOR AL DATA.FRAME
+```{r}
+datos_eventos2$sector <- sapply(datos_eventos2$location, function(loc) {
+  if(length(loc) >= 2) {
+    identificar_sector(loc[1], loc[2])
+  } else {
+     return(NA)   
+  }
+})
+```
+
+
+# LIMPIAR POSICIONES
+```{r}
+datos_eventos2 <- datos_eventos2 |> 
+  mutate(
+    position.name = if_else(
+    position.name %in% c("Left Back", "Right Back", 
+                    "Left Wing Back", "Right Wing Back", 
+                    "Left Wing", "Right Wing"),
+    position.name,
+   str_remove_all(position.name, "\\b(Left|Right)\\b")
+  ) |> 
+    str_squish() |> 
+    str_replace("^Center Attacking Midfield$", "Attacking Midfield") |> 
+    str_replace("^Center Defensive Midfield$", "Defensive Midfield") |>
+    str_replace("^Center Midfield$", "Midfield") |>
+    str_replace("Left Wing Back", "Left Back") |> 
+    str_replace("Right Wing Back", "Right Back")
+  )
+```
+
+
+# EVENTOS IMPORTANTES
+```{r}
+PORTERO <- c("Goal Keeper", "Own Goal Against", "Error", "Clearance", "Block", "Dispossessed", "Ball Recovery", "Pass", "Pressure", "Carry")
+
+CENTRAL <- c("Clearance", "Block", "Interception", "Duel", "Error", "Dispossessed", "Ball Recovery", "Dribbled Past", "Pass", "Foul Committed")
+
+LATERAL <- c("Dribble", "Pass", "Interception", "Clearance", "Duel", "Carry", "Ball Recovery", "Dispossessed", "Foul Committed", "Foul Won")
+
+PIVOTE <- c("Interception", "Ball Recovery", "Pressure", "Pass", "Error", "Duel", "Carry", "Dispossessed", "Foul Committed", "Shield")
+
+INTERIOR <- c("Pass", "Pressure", "Ball Recovery", "Carry", "Dribble", "Foul Won", "Duel", "Dispossessed", "Interception", "Ball Receipt")
+
+MEDIA_PUNTA <- c("Pass", "Dribble", "Shot", "Ball Receipt", "Carry", "Foul Won", "Pressure", "Dispossessed", "Error", "Duel")
+
+EXTREMO <- c("Dribble", "Carry", "Pass", "Shot", "Ball Receipt", "Foul Won", "Dispossessed", "Duel", "Pressure", "Interception")
+
+DELANTERO_CENTRO <- c("Shot", "Dribble", "Pass", "Ball Receipt", "Carry", "Foul Won", "Dispossessed", "Offside", "Duel", "Error")
+```
+
+
+# ASIGNACIÓN DE EVENTO POR POSICION
+```{r}
+datos_eventos2 <- datos_eventos2 |> 
+  mutate(important.event = case_when(
+    position.name == "Goalkeeper" & type.name %in% PORTERO ~ TRUE,
+    position.name == "Center Back" & type.name %in% CENTRAL ~ TRUE,
+    position.name == "Left Back" & type.name %in% LATERAL ~ TRUE,
+    position.name == "Right Back" & type.name %in% LATERAL ~ TRUE,
+    position.name == "Defensive Midfield" & type.name %in% PIVOTE ~ TRUE,
+    position.name == "Midfield" & type.name %in% INTERIOR ~ TRUE,
+    position.name == "Attacking Midfield" & type.name %in% MEDIA_PUNTA ~ TRUE,
+    position.name == "Left Wing" & type.name %in% EXTREMO ~ TRUE,
+    position.name == "Right Wing" & type.name %in% EXTREMO ~ TRUE,
+    position.name == "Center Forward" & type.name %in% DELANTERO_CENTRO ~ TRUE,
+    TRUE ~ FALSE
+  )
+)
+```
+
+
+# FILTRO EVENTOS
+```{r}
+datos_eventos2 <- datos_eventos2 |> 
+  filter(important.event == TRUE) |> 
+  add_count(player.name, position.name) |>   
+  filter(n >= 70) |>                          
+  select(-n) 
+```
+
+
+# SECTORES POR POSICIÓN
+```{r}
+PORTERO_SECTORES <- paste0("C3")
+CENTRAL_SECTORES <- paste0("C", c(2:4))
+LATERAL_IZQ_SECTORES <- paste0("C", c(1, 6))
+LATERAL_DER_SECTORES <- paste0("C", c(5, 10))
+PIVOTE_SECTORES <- paste0("C", c(7:9))
+INTERIOR_SECTORES <- paste0("C", c(11, 12, 14, 15))
+MEDIAPUNTA_SECTORES <- paste0("C", c(12:14))
+EXTREMO_IZQ_SECTORES <- paste0("C", c(11, 16))
+EXTREMO_DER_SECTORES <- paste0("C", c(15, 20))
+DELANTERO_SECTORES <- paste0("C", c(17:19))
+```
+
+
+# FUNCIÓN SECTORES ADYACENTES
+```{r}
+vecinos <- function(sector_name, sectors, diagonal = FALSE) {
+
+  base <- sectors[sectors$cell == sector_name, ]
+
+  if (nrow(base) == 0) stop("El sector no existe")
+
+  possible_neighbors <- sectors[
+    (sectors$col == base$col & sectors$row %in% c(base$row - 1, base$row + 1)) |
+    (sectors$row == base$row & sectors$col %in% c(base$col - 1, base$col + 1)),
+  ]
+
+  if (diagonal) {
+    diag_neighbors <- sectors[
+      sectors$col %in% c(base$col - 1, base$col + 1) &
+      sectors$row %in% c(base$row - 1, base$row + 1),
+    ]
+    possible_neighbors <- rbind(possible_neighbors, diag_neighbors)
+  }
+
+  return(possible_neighbors$cell)
+}
+```
+
+
+# SECTORES VECINOS
+```{r}
+PORTERO_VECINOS <- setdiff(
+  unique(unlist(lapply(PORTERO_SECTORES, vecinos, sectors = sectors, diagonal = F))),
+  PORTERO_SECTORES
+)
+
+CENTRAL_VECINOS <- setdiff(
+  unique(unlist(lapply(CENTRAL_SECTORES, vecinos, sectors = sectors, diagonal = F))),
+  CENTRAL_SECTORES
+)
+
+LATERAL_IZQ_VECINOS <- setdiff(
+  unique(unlist(lapply(LATERAL_IZQ_SECTORES, vecinos, sectors = sectors, diagonal = F))),
+  LATERAL_IZQ_SECTORES
+)
+
+LATERAL_DER_VECINOS <- setdiff(
+  unique(unlist(lapply(LATERAL_DER_SECTORES, vecinos, sectors = sectors, diagonal = F))),
+  LATERAL_DER_SECTORES
+)
+
+PIVOTE_VECINOS <- setdiff(
+  unique(unlist(lapply(PIVOTE_SECTORES, vecinos, sectors = sectors, diagonal = F))),
+  PIVOTE_SECTORES
+)
+
+INTERIOR_VECINOS <- setdiff(
+  unique(unlist(lapply(INTERIOR_SECTORES, vecinos, sectors = sectors, diagonal = F))),
+  INTERIOR_SECTORES
+)
+
+MEDIAPUNTA_VECINOS <- setdiff(
+  unique(unlist(lapply(MEDIAPUNTA_SECTORES, vecinos, sectors = sectors, diagonal = F))),
+  MEDIAPUNTA_SECTORES
+)
+
+EXTREMO_IZQ_VECINOS <- setdiff(
+  unique(unlist(lapply(EXTREMO_IZQ_SECTORES, vecinos, sectors = sectors, diagonal = F))),
+  EXTREMO_IZQ_SECTORES
+)
+
+EXTREMO_DER_VECINOS <- setdiff(
+  unique(unlist(lapply(EXTREMO_DER_SECTORES, vecinos, sectors = sectors, diagonal = F))),
+  EXTREMO_DER_SECTORES
+)
+
+DELANTERO_VECINOS <- setdiff(
+  unique(unlist(lapply(DELANTERO_SECTORES, vecinos, sectors = sectors, diagonal = F))),
+  DELANTERO_SECTORES
+)
+```
+
+
+
+# ASIGNACIÓN DE SECTORES POR POSICIÓN
+```{r}
+datos_eventos2 <- datos_eventos2 |> 
+  mutate(sector.event = case_when(
+    position.name == "Goalkeeper" & sector %in% PORTERO_SECTORES ~ TRUE,
+    position.name == "Center Back" & sector %in% CENTRAL_SECTORES ~ TRUE,
+    position.name == "Left Back" & sector %in% LATERAL_IZQ_SECTORES ~ TRUE,
+    position.name == "Right Back" & sector %in% LATERAL_DER_SECTORES ~ TRUE,
+    position.name == "Defensive Midfield" & sector %in% PIVOTE_SECTORES ~ TRUE,
+    position.name == "Midfield" & sector %in% INTERIOR_SECTORES ~ TRUE,
+    position.name == "Attacking Midfield" & sector %in% MEDIAPUNTA_SECTORES ~ TRUE,
+    position.name == "Left Wing" & sector %in% EXTREMO_IZQ_SECTORES ~ TRUE,
+    position.name == "Right Wing" & sector %in% EXTREMO_DER_SECTORES ~ TRUE,
+    position.name == "Center Forward" & sector %in% DELANTERO_SECTORES ~ TRUE,
+    TRUE ~ FALSE
+  ),
+  neighbor.event = case_when(
+    position.name == "Goalkeeper" & sector %in% PORTERO_VECINOS ~ TRUE,
+    position.name == "Center Back" & sector %in% CENTRAL_VECINOS ~ TRUE,
+    position.name == "Left Back" & sector %in% LATERAL_IZQ_VECINOS ~ TRUE,
+    position.name == "Right Back" & sector %in% LATERAL_DER_VECINOS ~ TRUE,
+    position.name == "Defensive Midfield" & sector %in% PIVOTE_VECINOS ~ TRUE,
+    position.name == "Midfield" & sector %in% INTERIOR_VECINOS ~ TRUE,
+    position.name == "Attacking Midfield" & sector %in% MEDIAPUNTA_VECINOS ~ TRUE,
+    position.name == "Left Wing" & sector %in% EXTREMO_IZQ_VECINOS ~ TRUE,
+    position.name == "Right Wing" & sector %in% EXTREMO_DER_VECINOS ~ TRUE,
+    position.name == "Center Forward" & sector %in% DELANTERO_VECINOS ~ TRUE,
+    TRUE ~ FALSE
+  )
+)
+```
+
+
+# GRAFICOS
+```{r}
+grafico <- function(player, sectores = FALSE, vecinos = FALSE, plotly = FALSE){
+  
+  sectors_plot <- sectors
+  sectors_plot$cell <- as.character(sectors_plot$cell)
+  
+  datos_jugador <- datos_eventos2 |> filter(player.name == player)
+  
+  coords <- lapply(datos_jugador$location, function(l) if(length(l) > 2) l[1:2] else l)
+  coords <- do.call(rbind, coords)
+  coords <- as.data.frame(coords)
+  colnames(coords) <- c("x", "y")
+  
+  coords$sector <- as.character(datos_jugador$sector)
+  coords$type.name <- datos_jugador$type.name
+  coords$sector.event <- datos_jugador$sector.event
+  coords$neighbor.event <- datos_jugador$neighbor.event
+  
+  sectors_plot$zona <- "normal"
+  
+  if (sectores) {
+    sectores_jugador <- unique(coords$sector[coords$sector.event])
+    sectors_plot$zona[sectors_plot$cell %in% sectores_jugador] <- "jugador"
+  }
+  
+  if (vecinos) {
+    sectores_vecinos <- unique(coords$sector[coords$neighbor.event])
+    sectores_vecinos <- setdiff(sectores_vecinos, sectors_plot$cell[sectors_plot$zona == "jugador"])
+    sectors_plot$zona[sectors_plot$cell %in% sectores_vecinos] <- "vecino"
+    
+    coords <- coords[coords$sector.event | coords$neighbor.event, ]
+  } else if (sectores) {
+    coords <- coords[coords$sector.event, ]
+  }
+  
+  colores_zona <- c(
+    "normal"  = "#2E8B57",
+    "vecino"  = "#2E7D32",
+    "jugador" = "#1B5E20"
+  )
+  
+  p <- ggplot() +
+    geom_rect(data = sectors_plot,
+              aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = zona),
+              color = "white") +
+    scale_fill_manual(values = colores_zona, guide = "none") +
+    
+    geom_vline(xintercept = seq(col_width, field_length - col_width, by = col_width),
+               colour = "white") +
+    geom_hline(yintercept = seq(row_height, field_width - row_height, by = row_height),
+               colour = "white") +
+    
+    geom_text(data = sectors_plot,
+              aes(x = (xmin + xmax)/2, y = (ymin + ymax)/2, label = cell),
+              colour = "white", size = 5, fontface = "bold") +
+    
+    geom_point(data = coords,
+               aes(x = x, y = y, colour = type.name), size = 1.2) +
+    
+    coord_fixed(xlim = c(0, field_length), ylim = c(0, field_width), expand = FALSE) +
+    scale_y_reverse() +
+    
+    labs(title = paste("Acciones de", player),
+         x = "Largo (m)", y = "Ancho (m)", colour = "Tipo de evento") +
+    
+    theme_minimal(base_size = 14) +
+    theme(
+      panel.background = element_rect(fill = "#2E8B60", colour = NA),
+      plot.background  = element_rect(fill = "#2E8B57", colour = NA),
+      panel.grid.major = element_line(colour = "white", linetype = "dashed", size = 0.3),
+      panel.grid.minor = element_blank(),
+      axis.title = element_text(colour = "white", face = "bold"),
+      axis.text  = element_text(colour = "white"),
+      plot.title = element_text(colour = "white", face = "bold", hjust = 0.5)
+    )
+  
+  if (plotly) {
+    return(ggplotly(p)) 
+  }
+  else {
+    return(p)
+  }
+}
+```
+
+
+```{r}
+grafico("Jude Bellingham")
+```
+
+```{r}
+grafico("Jude Bellingham", sectores = T)
+```
+
+
+```{r}
+grafico("Jude Bellingham", sectores = TRUE, vecinos = TRUE)
+```
+
+
+```{r}
+grafico("Jude Bellingham", sectores = TRUE, vecinos = TRUE, plotly = TRUE)
+```
+
+
+# EVENTOS FINALES
+```{r}
+datos_eventos_final <- datos_eventos2 |> 
+  filter(important.event == TRUE,
+         sector.event == TRUE | neighbor.event == TRUE)
+```
+
+
+# CONTEO SECTORES
+```{r}
+datos_eventos_sector <- datos_eventos_final |> 
+  group_by(player.name, position.name, type.name, sector) |> 
+  summarise(
+    count.event = sum(important.event, na.rm = TRUE),         
+    count.event.neighbor = sum(neighbor.event, na.rm = TRUE),       
+    .groups = "drop"
+  )
+```
+
+
+# CONTEO EVENTOS
+```{r}
+datos_eventos_final <- datos_eventos_final |> 
+  add_count(player.name, position.name, type.name, name = "count.event") |> 
+  add_count(player.name, position.name, type.name, neighbor.event, name = "count.event.neighbor") |>
+  distinct(team.name, player.name, position.name, type.name, count.event, count.event.neighbor) 
+```
+
+
+# RELLENO EVENTOS SIN CONTEO
+```{r, warning=F}
+posiciones_eventos <- list(
+  "Goalkeeper" = PORTERO,
+  "Center Back" = CENTRAL,
+  "Left Back" = LATERAL,
+  "Right Back" = LATERAL,
+  "Defensive Midfield" = PIVOTE,
+  "Midfield" = INTERIOR,
+  "Attacking Midfield" = MEDIA_PUNTA,
+  "Left Wing" = EXTREMO,
+  "Right Wing" = EXTREMO,
+  "Center Forward" = DELANTERO_CENTRO
+)
+
+df_jugador_equipo <- datos_eventos_final |>
+  distinct(player.name, team.name)
+
+df_eventos_unicos <- datos_eventos_final |>
+  group_by(player.name, position.name, type.name) |>
+  summarise(
+    count.event = first(count.event),
+    count.event.neighbor = first(count.event.neighbor),
+    .groups = "drop"
+  )
+
+datos_eventos_final <- datos_eventos_final |>
+  distinct(player.name, position.name) |>
+  left_join(
+    stack(posiciones_eventos) |>
+      rename(
+        type.name = values,
+        position.name = ind
+      ),
+    by = "position.name",
+    relationship = "many-to-many"
+  ) |>
+  left_join(
+    df_eventos_unicos,
+    by = c("player.name","position.name","type.name")
+  ) |>
+  mutate(
+    count.event = replace_na(count.event, 0),
+    count.event.neighbor = replace_na(count.event.neighbor, 0)
+  ) |>
+  left_join(df_jugador_equipo, by = "player.name") |>
+  select(team.name, player.name, position.name, type.name,
+         count.event, count.event.neighbor)
+```
+
+
+# EVENTOS POR SECTOR COMPLETO
+```{r, warning=F}
+df_eventos_unicos_sector <- datos_eventos_sector |>
+  group_by(player.name, position.name, type.name, sector) |>
+  summarise(
+    count.event = first(count.event),
+    count.event.neighbor = first(count.event.neighbor),
+    .groups = "drop"
+  )
+
+datos_eventos_sector <- datos_eventos_sector |>
+  distinct(player.name, position.name, sector) |>
+  left_join(
+    stack(posiciones_eventos) |>
+      rename(
+        type.name = values,
+        position.name = ind
+      ),
+    by = "position.name",
+    relationship = "many-to-many"
+  ) |>
+  left_join(
+    df_eventos_unicos_sector,
+    by = c("player.name","position.name","type.name","sector")
+  ) |>
+  mutate(
+    count.event = replace_na(count.event, 0),
+    count.event.neighbor = replace_na(count.event.neighbor, 0)
+  ) |>
+  left_join(df_jugador_equipo, by = "player.name") |>
+  select(team.name, player.name, position.name, type.name, sector,
+         count.event, count.event.neighbor) |> 
+  arrange(player.name, position.name, type.name, sector)
+```
+
+
+# PUNTUACIONES
+```{r}
+score <- read.xlsx(here("Datos", "Valores ranking posiciones.xlsx"))
+
+datos_eventos_final <- datos_eventos_final |> 
+  left_join(score, by = c("position.name" = "Posición", "type.name" = "Variable")) |> 
+  select(-Justificacion, -Justificacion.detallada) |> 
+  mutate(score.event = (count.event - count.event.neighbor) * Valor.Ajustado + 
+           count.event.neighbor * Valor.Ajustado / 2)
+
+datos_eventos_sector <- datos_eventos_sector |> 
+  left_join(score, by = c("position.name" = "Posición", "type.name" = "Variable")) |> 
+  select(-Justificacion, -Justificacion.detallada) |> 
+  mutate(score.event = (count.event - count.event.neighbor) * Valor.Ajustado + 
+           count.event.neighbor * Valor.Ajustado / 2) |> 
+  arrange(player.name, position.name, type.name, sector)
+```
+
+
+# PIVOTAR
+```{r}
+datos_eventos_pivot <- datos_eventos_final |> 
+  select(player.name, position.name, type.name, score.event) |> 
+  distinct() |> 
+  pivot_wider(names_from = type.name,
+              values_from = c(score.event),
+              values_fill = 0) |> 
+  mutate(across(where(is.numeric), ~ as.numeric(scale(.x))))
+```
+
+
+## Matriz correlacion
+```{r}
+cor_matrix <- cor(datos_eventos_pivot |> 
+                    filter(position.name == "Right Wing") |> 
+                    select(all_of(posiciones_eventos[["Right Wing"]])) |> 
+                    select(where(~ sd(.x) > 0))) 
+
+corrplot(cor_matrix, method = "color", type = "upper", tl.col = "black", tl.srt = 45)
+```
+
+
+# PCA
+```{r}
+posiciones <- unique(datos_eventos_final$position.name)
+
+pca_por_posicion <- function(pos) {
+  
+  datos_pos <- datos_eventos_pivot |> 
+    filter(position.name == pos) |> 
+    select(all_of(posiciones_eventos[[pos]])) |> 
+    select(where(~ sd(.x) > 0))
+  
+  PCA <- principal(datos_pos, nfactors = 2, rotate = "none")
+  
+  return(PCA)
+}
+
+lista_PCA <- map(posiciones, pca_por_posicion)
+
+names(lista_PCA) <- posiciones
+```
+
+
+## Ejemplo
+```{r}
+lista_PCA$'Left Back'$loadings
+```
+
+
+## Comunalidad (ejemplo)
+```{r}
+bp <- barplot(lista_PCA$'Left Back'$communality, main = "Comunalidad de las Variables", 
+              col = "lightblue", xaxt = "n")
+
+text(x = bp, y = par("usr")[3] - 0.02, labels = names(lista_PCA$Midfield$communality),
+  srt = 45, adj = 1, xpd = TRUE, cex = 0.8)
+
+abline(h = 0.6, col = "red", lwd = 2, lty = 2)
+```
+
+
+## Residuos (ejemplo)
+```{r}
+residuos_fact <- colMeans(lista_PCA$'Left Back'$residual)
+
+any(residuos_fact > 0.07)
+```
+
+```{r}
+mean(residuos_fact)
+```
+
+
+# NUEVOS DATOS
+```{r}
+pca_scores_total <- map2_dfr(
+  names(lista_PCA),       
+  lista_PCA,            
+  
+  function(pos, pca_obj) {
+    df <- as.data.frame(pca_obj$scores)
+    df$position.name <- pos
+    df$player.name <- datos_eventos_pivot |> 
+      filter(position.name == pos) |> 
+      pull(player.name)
+    
+    df
+  }
+)
+
+pca_scores_total <- pca_scores_total |>
+  select(player.name, position.name, PC1, PC2)
+```
+
+
+# GRAFICA PCA
+```{r}
+grafica_PCA <- function(pos) {
+
+  pca_obj <- lista_PCA[[pos]]
+
+  scores <- as.data.frame(pca_obj$scores)
+  colnames(scores) <- c("PC1", "PC2")
+
+  ggplot(scores, aes(x = PC1, y = PC2)) +
+    geom_point(color = "steelblue", size = 2) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+    labs(
+      title = paste("Gráfico PCA -", pos, ": PC1 vs PC2"),
+      x = "PC1",
+      y = "PC2"
+    ) +
+    theme_minimal()
+}
+```
+
+
+```{r}
+grafica_PCA("Midfield")
+```
+
+
+# NIVELES POSICION
+```{r}
+k_por_posicion <- tibble(
+  posiciones,
+  centers = c(2, 3, 2, 3, 5, 2, 3, 3, 2, 2)
+)
+```
+
+
+#CLUSTERING
+```{r}
+clustering_por_posicion <- function(posicion, k) {
+  datos_pos <- pca_scores_total |> filter(position.name == posicion)
+  kmeans(datos_pos[, -c(1:2)], centers = k, nstart = 25)
+}
+
+set.seed(12345)
+lista_clusters <- map2(k_por_posicion$posiciones,
+                       k_por_posicion$centers,
+                       clustering_por_posicion)
+
+names(lista_clusters) <- k_por_posicion$posiciones
+```
+
+
+# GRAFICO CLUSTERING
+```{r}
+grafica_cluster <- function(posicion) {
+  
+  datos_pos <- pca_scores_total |> filter(position.name == posicion)
+  
+  clusters <- lista_clusters[[posicion]]
+  clusters_vec <- as.factor(clusters$cluster)
+  
+  plot_df <- datos_pos[, c("player.name", "PC1", "PC2")]
+  plot_df$cluster <- clusters_vec
+  
+  ggplot(plot_df, aes(x = PC1, y = PC2, color = cluster)) +
+    geom_point(size = 4, alpha = 0.9) +
+    geom_text_repel(
+      aes(label = player.name),
+      size = 3,
+      fontface = "bold",
+      max.overlaps = Inf,
+      point.padding = 0.3
+    ) +
+    labs(
+      title = paste0("Clustering ", posicion, ": PC1 vs PC2"),
+      x = "PC1",
+      y = "PC2",
+      color = "Cluster"
+    ) +
+    scale_color_brewer(palette = "Set1") +
+    theme_minimal(base_size = 14) +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0.5)
+    )
+}
+```
+
+
+```{r}
+grafica_cluster("Center Forward")
+```
+
+
+# CLUSTER DE CADA JUGADOR
+```{r}
+tabla_clusters <- map2_dfr(
+  names(lista_clusters),
+  lista_clusters,
+  ~{
+    modelo <- .y
+    pos <- .x
+    
+    jugadores <- pca_scores_total |> 
+      filter(position.name == pos) |> 
+      pull(player.name)
+    
+    tibble(
+      player.name = jugadores,
+      position.name = pos,
+      cluster = modelo$cluster
+    )
+  }
+)
+
+datos_eventos_final <- datos_eventos_final |> 
+  left_join(tabla_clusters, by = c("player.name", "position.name"))
+```
+
+
+
+# PERCENTILES
+```{r}
+datos_percentiles <- datos_eventos_final |> 
+  group_by(position.name, type.name) |> 
+  mutate(percentil = round(percent_rank(score.event) * 100)) |> 
+  group_by(position.name, type.name, cluster) |> 
+  mutate(percentil.cluster = round(percent_rank(score.event) * 100)) |> 
+  ungroup() |> 
+  unique()
+```
+
+
+# GRÁFICO PERCENTIL
+```{r}
+graficar_percentil <- function(jugador, cluster = FALSE) {
+  
+  if (cluster) {
+    datos_percentiles$percentil <- datos_percentiles$percentil.cluster
+  }
+  
+  df_jugador <- datos_percentiles |>  
+    filter(player.name == jugador) |> 
+    mutate(percentil_rango = case_when(
+      percentil <= 25 ~ "1",
+      percentil <= 50 ~ "2",
+      percentil <= 75 ~ "3",
+      TRUE ~ "4"
+    ))
+  
+  colores <- c("1" = "#B22222",  
+               "2" = "#FF6347",  
+               "3" = "#87CEFA",  
+               "4" = "#1E90FF")  
+  
+ggplot(df_jugador, aes(x = type.name, y = percentil, fill = percentil_rango)) +
+    geom_col(show.legend = FALSE) +
+    geom_text(aes(label = percentil), vjust = -0.5) + 
+    scale_fill_manual(values = colores) +
+    facet_wrap(~position.name, scales = "free_x", nrow = 1) + 
+    labs(title = jugador,
+         x = "Tipo",
+         y = "Percentil") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          strip.text = element_text(face = "bold", size = 12))
+}
+```
+
+
+```{r}
+graficar_percentil("Federico Santiago Valverde Dipetta")
+```
+
+
+```{r}
+graficar_percentil("Federico Santiago Valverde Dipetta", cluster = TRUE)
+```
+
+
+# RANKING
+```{r}
+ranking <- datos_eventos_final |> 
+  group_by(player.name, position.name, cluster) |> 
+  summarise(score = sum(score.event, na.rm = TRUE), .groups = "drop") |>  
+  arrange(position.name, cluster, desc(score))
+```
+
+
+# JUGADORES SIMILARES
+```{r}
+jugadores_similares <- function(player, n = 0) {
+  
+  jugador <- datos_eventos_sector |> 
+    filter(player.name == player) |> 
+    mutate(sector_event = make.names(paste0(sector, "_", type.name))) |>
+    select(player.name, position.name, sector_event, score.event) |>
+    distinct()
+  
+  jugador_wide <- jugador |> 
+    pivot_wider(
+      names_from = sector_event,
+      values_from = score.event,
+      values_fill = 0
+    ) |> 
+    select(-position.name) |> 
+    group_by(player.name) |> 
+    summarise(across(everything(), sum), .groups = "drop")
+  
+  eventos_ids <- colnames(jugador_wide)[!colnames(jugador_wide) %in% "player.name"]
+  
+  sector_pivot <- datos_eventos_sector |> 
+    filter(player.name != player) |>
+    mutate(sector_event = make.names(paste0(sector, "_", type.name))) |> 
+    filter(sector_event %in% eventos_ids) |> 
+    select(player.name, position.name, sector_event, score.event) |> 
+    distinct() |> 
+    pivot_wider(
+      names_from = sector_event, 
+      values_from = score.event, 
+      values_fill = 0
+    ) |> 
+    select(-position.name) |> 
+    group_by(player.name) |> 
+    summarise(across(everything(), sum), .groups = "drop")
+  
+  sector_pivot <- as.data.frame(bind_rows(jugador_wide, sector_pivot))
+  rownames(sector_pivot) <- sector_pivot$player.name
+  sector_pivot <- sector_pivot |> select(-player.name)
+  
+  distEucl <- dist(scale(sector_pivot))
+  
+  dist_long <- as.data.frame(as.table(as.matrix(distEucl))) |> 
+    rename(
+      jugador1 = Var1,
+      jugador2 = Var2,
+      distancia = Freq
+    ) |> 
+    filter(jugador1 != jugador2, jugador1 == player) |> 
+    arrange(distancia) |> 
+    mutate(similitud = round((1 - distancia / max(distancia)) * 100, 2))
+  
+  if (n > 0) {
+    dist_long <- dist_long |> 
+      slice_head(n = n)
+  } 
+  
+  list(
+    dist_long = dist_long,
+    distEucl = distEucl,
+    sector_pivot = sector_pivot
+  )
+}
+```
+
+
+## Ejemplo
+```{r}
+dist <- jugadores_similares("Federico Santiago Valverde Dipetta", n = 5)
+dist$dist_long
+```
+
+
+## MDS
+```{r}
+faoMDS <- mds(dist$distEucl, type = "interval")
+
+faoMDS$stress
+```
+
+
+## COORDENADAS MDS
+```{r}
+coords <- as.data.frame(faoMDS$conf)
+coords$player <- rownames(dist$sector_pivot)
+coords <- coords |> 
+  mutate(tipo = case_when(
+      player %in% as.character(dist$dist_long$jugador1) ~ "jugador",
+      player %in% as.character(dist$dist_long$jugador2) ~ "top_similares",
+      TRUE ~ "otros"
+    ))
+```
+
+
+## GRAFICA MDS
+```{r}
+ggplot(coords, aes(x = D1, y = D2, color = tipo)) +
+    geom_point(size = 4, alpha = 0.9) +
+    geom_text_repel(aes(label = player),
+                    size = 3,
+                    fontface = "bold",
+                    max.overlaps = Inf,
+                    point.padding = 0.3) +
+    scale_color_manual(values = 
+                         c("jugador" = "blue", "top_similares" = "red", "otros" = "grey")) +
+    labs(
+      title = paste("MDS de jugadores por eventos -", as.character(dist$dist_long$jugador1)),
+      x = "MDS1",
+      y = "MDS2",
+      color = "Tipo"
+    ) +
+    theme_minimal(base_size = 14) +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0.5)
+    )
+```
+
+
+# CONSULTAS
+## Buscar jugador
+```{r}
+posicion <- datos_eventos2 |> 
+  filter(position.name == "Center Back")
+sort(unique(posicion$player.name))
+```
+
+
+## Top 5 por posicion y cluster
+```{r}
+View(ranking |>
+  group_by(position.name, cluster) |>
+  slice_max(score, n = 5) |> 
+  ungroup())
+```
+
+
+
+
+
+
