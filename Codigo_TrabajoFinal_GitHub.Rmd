@@ -868,6 +868,17 @@ ranking <- datos_eventos_final |>
 ```
 
 
+# RANKING PCA
+```{r}
+pca_scores_total <- pca_scores_total |> 
+  left_join(tabla_clusters, by = c("player.name", "position.name"))
+
+ranking_pca <- pca_scores_total |> 
+  group_by(player.name, position.name, cluster) |> 
+  arrange(position.name, cluster, desc(PC1))
+```
+
+
 # JUGADORES SIMILARES
 ```{r}
 jugadores_similares <- function(player, n = 0) {
@@ -1005,6 +1016,13 @@ View(ranking |>
 ```
 
 
+## Top 5 por posicion y cluster (PCA)
+```{r}
+View(ranking_pca |>
+  group_by(position.name, cluster) |>
+  slice_max(PC1, n = 5) |> 
+  ungroup())
+```
 
 
 
